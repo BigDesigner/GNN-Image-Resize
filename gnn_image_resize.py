@@ -3,17 +3,19 @@
 """
 GNN Image Resize
 - Çoklu dosya ve klasör seçimi
-- Yüzdeye göre veya piksele göre yeniden boyutlandırma
-- 72–300 DPI aralığında DPI yazma
+- Yüzdeye veya piksele göre yeniden boyutlandırma
+- 72–300 DPI yazma
 - JPG/PNG/WebP/TIFF/BMP/GIF (statik) gibi yaygın formatlar (Pillow desteği kapsamında)
 - Oran koruma, EXIF koruma (opsiyon), kalite ayarı (JPEG/WebP)
-- LANCZOS (önerilen) dahil çeşitli yeniden örnekleme filtreleri
+- LANCZOS/BICUBIC/BILINEAR/NEAREST filtreleri
 - İlerleme çubuğu, iptal etme
+- Hata loglama (çıktı klasöründe gnn_image_resize_errors.log)
 """
 
 import os
 import sys
 import threading
+import traceback
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -23,13 +25,23 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageOps, UnidentifiedImageError, ExifTags
 
 APP_NAME = "GNN Image Resize"
-SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
+SUPPORTED_EXTS = {".jpg", ".jpeg", ".jpe", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 
-# Pillow EXIF tag id -> name haritası (gerekirse)
+# EXIF tag id -> name haritası (gerekirse)
 EXIF_TAGS = {v: k for k, v in ExifTags.TAGS.items()}
+
+# Filtre açıklamaları (UI'da gösterilir)
+FILTER_DESCRIPTIONS = {
+    "LANCZOS": "Çok yüksek kalite, daha yavaş; özellikle küçültmede çok net sonuç verir.",
+    "BICUBIC": "Orta-yüksek kalite; büyütme/küçültmede dengeli ve pürüzsüz.",
+    "BILINEAR": "Orta kalite, daha hızlı; kenarlar biraz yumuşar.",
+    "NEAREST": "En hızlı, en düşük kalite; piksel-art/ikon gibi işlerde net kenarlar.",
+}
+
 
 def clamp(n, lo, hi):
     return max(lo, min(hi, n))
+
 
 def resample_from_name(name: str):
     name = name.upper()
@@ -41,6 +53,7 @@ def resample_from_name(name: str):
         return Image.BICUBIC
     # Varsayılan en iyi kalite
     return Image.LANCZOS
+
 
 def guess_output_ext(fmt_choice: str, src_ext: str) -> str:
     if fmt_choice == "Orijinal":
@@ -55,8 +68,9 @@ def guess_output_ext(fmt_choice: str, src_ext: str) -> str:
     }
     return mapping.get(fmt_choice, src_ext.lower())
 
+
 def normalize_mode_for_save(img: Image.Image, out_fmt: str) -> Image.Image:
-    # JPEG alfayı desteklemez -> beyaz zeminle birleştir
+    # JPEG alfa kanalını desteklemez -> beyaz arka planla birleştir
     if out_fmt.upper() in ("JPEG", "JPG"):
         if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
             bg = Image.new("RGB", img.size, (255, 255, 255))
@@ -67,13 +81,15 @@ def normalize_mode_for_save(img: Image.Image, out_fmt: str) -> Image.Image:
     # Diğer formatlarda genelde dönüştürmeye gerek yok
     return img
 
+
 def safe_open_image(path: Path) -> Optional[Image.Image]:
     try:
         im = Image.open(str(path))
-        im.load()
+        im.load()  # dosyayı tamamen belleğe al
         return im
     except (UnidentifiedImageError, OSError):
         return None
+
 
 def oriented(im: Image.Image) -> Image.Image:
     # EXIF Orientation'a göre döndür
@@ -82,6 +98,7 @@ def oriented(im: Image.Image) -> Image.Image:
     except Exception:
         pass
     return im
+
 
 def compute_new_size(
     im: Image.Image,
@@ -108,48 +125,44 @@ def compute_new_size(
                 ratio = target_h / h
                 target_w = max(1, int(round(w * ratio)))
             else:
-                # İkisi de verilmişse; kısa kenarı baz alarak orana uydurmak:
-                # (Kullanıcı hem w hem h girmişse oran koruma açıkken,
-                #  orana en yakın değer setlenecek)
+                # İkisi de verilmişse; kaynak orana yaklaştır
                 src_ratio = w / h
                 tgt_ratio = target_w / target_h
                 if tgt_ratio > src_ratio:
-                    # genişlik fazla -> yükseklik baz
                     target_w = int(round(target_h * src_ratio))
                 else:
-                    # yükseklik fazla -> genişlik baz
                     target_h = int(round(target_w / src_ratio))
         return max(1, target_w), max(1, target_h)
+
 
 def save_image(
     im: Image.Image,
     out_path: Path,
-    out_fmt_choice: str,
+    out_fmt_choice: Optional[str],
     dpi: Optional[int],
     keep_exif: bool,
     quality: int
 ):
+    """
+    Uyumluluk için subsampling parametresi kullanılmıyor.
+    optimize=True genel olarak güvenli; problem çıkarsa kaldırılabilir.
+    """
     params = {}
     out_fmt = None
 
-    if out_fmt_choice == "Orijinal":
-        # Pillow, formatı uzantıdan tahmin ediyor
-        out_fmt = None
-    else:
-        out_fmt = out_fmt_choice
+    # Hedef format
+    if isinstance(out_fmt_choice, str) and out_fmt_choice != "Orijinal":
+        out_fmt = out_fmt_choice  # "JPEG", "PNG", vs.
 
     # DPI
     if dpi:
-        dpi_val = (dpi, dpi)
-        params["dpi"] = dpi_val
+        params["dpi"] = (dpi, dpi)
 
     # JPEG/WebP kalite
-    if out_fmt_choice in ("JPEG", "WEBP") or out_path.suffix.lower() in (".jpg", ".jpeg", ".webp"):
+    ext = out_path.suffix.lower()
+    if (isinstance(out_fmt_choice, str) and out_fmt_choice in ("JPEG", "WEBP")) or ext in (".jpg", ".jpeg", ".webp"):
         params["quality"] = clamp(quality, 1, 100)
-        if out_fmt_choice == "JPEG" or out_path.suffix.lower() in (".jpg", ".jpeg"):
-            # Dosya boyutunu makul tutmak için optimize
-            params["optimize"] = True
-            params["subsampling"] = "keep"  # Pillow>=10 için uygun seçenek
+        params["optimize"] = True
 
     # EXIF
     if keep_exif:
@@ -162,12 +175,13 @@ def save_image(
 
     im.save(str(out_path), format=out_fmt, **params)
 
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("880x640")
-        self.minsize(820, 560)
+        self.geometry("900x650")
+        self.minsize(840, 560)
 
         self.files: List[Path] = []
         self.stop_flag = False
@@ -193,7 +207,7 @@ class App(tk.Tk):
         self.tree = ttk.Treeview(self, columns=("path", "size"), show="headings", height=12)
         self.tree.heading("path", text="Dosya Yolu")
         self.tree.heading("size", text="Boyut (px)")
-        self.tree.column("path", width=640, anchor="w")
+        self.tree.column("path", width=660, anchor="w")
         self.tree.column("size", width=120, anchor="center")
         self.tree.pack(fill="both", expand=True, **pad)
 
@@ -255,6 +269,18 @@ class App(tk.Tk):
                                     values=["LANCZOS", "BICUBIC", "BILINEAR", "NEAREST"], width=10)
         filter_combo.grid(row=2, column=7, sticky="w", **pad)
 
+        # Filtre açıklaması
+        self.filter_desc_var = tk.StringVar(value=FILTER_DESCRIPTIONS[self.filter_var.get()])
+        lbl_filter_desc = ttk.Label(mid, textvariable=self.filter_desc_var, wraplength=400, foreground="gray")
+        lbl_filter_desc.grid(row=3, column=6, columnspan=2, sticky="w", **pad)
+
+        # Seçim değişince açıklamayı güncelle
+        def on_filter_change(event=None):
+            desc = FILTER_DESCRIPTIONS.get(self.filter_var.get(), "")
+            self.filter_desc_var.set(desc)
+
+        filter_combo.bind("<<ComboboxSelected>>", on_filter_change)
+
         # EXIF
         self.keep_exif_var = tk.BooleanVar(value=True)
         chk_exif = ttk.Checkbutton(mid, text="EXIF koru (mümkünse)", variable=self.keep_exif_var)
@@ -291,10 +317,12 @@ class App(tk.Tk):
 
         self._toggle_mode()
 
+    # ------- UI Events -------
+
     def add_files(self):
         paths = filedialog.askopenfilenames(
             title="Resim dosyalarını seç",
-            filetypes=[("Resimler", "*.jpg;*.jpeg;*.png;*.webp;*.bmp;*.tif;*.tiff;*.gif"),
+            filetypes=[("Resimler", "*.jpg;*.jpeg;*.jpe;*.png;*.webp;*.bmp;*.tif;*.tiff;*.gif"),
                        ("Tümü", "*.*")]
         )
         for p in paths:
@@ -345,10 +373,6 @@ class App(tk.Tk):
             self.ent_height.configure(state="normal")
 
     def lock_ui(self, locked: bool):
-        widgets = [
-            self.btn_start, self.btn_stop, self.ent_percent, self.ent_width,
-            self.ent_height
-        ]
         if locked:
             self.btn_start.configure(state="disabled")
             self.btn_stop.configure(state="normal")
@@ -404,6 +428,8 @@ class App(tk.Tk):
             else:
                 self.status_var.set("Durduruldu.")
 
+    # ------- İş Mantığı -------
+
     def _process_all(
         self,
         mode: str,
@@ -419,29 +445,45 @@ class App(tk.Tk):
         out_dir: Path
     ):
         errs = 0
+        first_error_msg = None
+        log_path = out_dir / "gnn_image_resize_errors.log"
+
+        # Eski logu temizle
+        try:
+            if log_path.exists():
+                log_path.unlink()
+        except Exception:
+            pass
+
         rsmpl = resample_from_name(resample)
+        total = len(self.files)
+
         for idx, path in enumerate(self.files, start=1):
             if self.stop_flag:
                 break
             try:
                 im = safe_open_image(path)
                 if im is None:
-                    raise ValueError("Açılamadı veya desteklenmiyor.")
+                    raise ValueError("Dosya açılamadı veya desteklenmiyor.")
 
                 im = oriented(im)
+
                 new_w, new_h = compute_new_size(
                     im, mode, percent, width_px, height_px, keep_aspect
                 )
+
                 if (new_w, new_h) != im.size:
                     im = im.resize((new_w, new_h), rsmpl)
 
-                # Çıktı dosya adı
                 out_ext = guess_output_ext(fmt, path.suffix)
                 out_name = f"{path.stem}_{new_w}x{new_h}{out_ext}"
                 out_path = out_dir / out_name
 
-                im_to_save = normalize_mode_for_save(im, fmt if fmt != "Orijinal" else out_ext.replace(".", ""))
+                # JPEG alfa düzeltmesi vs.
+                fmt_for_norm = fmt if fmt != "Orijinal" else out_ext.replace(".", "")
+                im_to_save = normalize_mode_for_save(im, fmt_for_norm)
 
+                # Kaydet
                 save_image(
                     im_to_save,
                     out_path,
@@ -450,18 +492,43 @@ class App(tk.Tk):
                     keep_exif,
                     quality
                 )
+
+                # Gerçekten oluşmuş mu kontrol et
+                if not out_path.exists() or out_path.stat().st_size == 0:
+                    raise IOError("Kaydetme başarısız: çıktı dosyası oluşmadı.")
+
             except Exception as e:
                 errs += 1
-                print(f"Hata: {path} -> {e}", file=sys.stderr)
+                err_text = f"[{idx}/{total}] {path} -> {e}\n{traceback.format_exc()}\n"
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(err_text)
+                except Exception:
+                    pass
+                if first_error_msg is None:
+                    first_error_msg = str(e)
             finally:
                 self.progress.step(1)
-                self.status_var.set(f"{idx}/{len(self.files)} işlendi. Hata: {errs}")
+                self.status_var.set(f"{idx}/{total} işlendi. Hata: {errs}")
+
+        # İş bittiğinde hata varsa kullanıcıyı bilgilendir
+        if errs > 0 and first_error_msg:
+            self.after(0, lambda: messagebox.showerror(
+                APP_NAME,
+                f"İşlem {errs} hatayla tamamlandı.\n"
+                f"İlk hata: {first_error_msg}\n\n"
+                f"Ayrıntılar için log dosyası:\n{log_path}"
+            ))
+
+# ------- Entry Point -------
 
 def main():
-    # Pillow + Tk birlikte PyInstaller'da bazen arama problemi yaşar:
-    # --hidden-import=PIL._tkinter_finder parametresi tavsiye edilir.
+    # PyInstaller notu:
+    #   Bazı ortamlarda Tk + Pillow için şu gizli import gerekebilir:
+    #   --hidden-import PIL._tkinter_finder
     app = App()
     app.mainloop()
+
 
 if __name__ == "__main__":
     main()
