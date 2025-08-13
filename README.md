@@ -5,8 +5,9 @@
 With its intuitive interface and flexible settings, it’s suitable for both basic and advanced resizing needs.
 
 ---
-[https://i.imgur.com/K7CHFBf.png](https://i.imgur.com/K7CHFBf.png)
----
+
+![Screenshot](https://i.imgur.com/K7CHFBf.png)
+
 
 ## ✨ Features
 
@@ -68,8 +69,9 @@ Licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
 Sezgisel arayüzü ve esnek ayarları sayesinde hem temel hem de ileri seviye ihtiyaçlar için uygundur.
 
 ---
-[https://i.imgur.com/K7CHFBf.png](https://i.imgur.com/K7CHFBf.png)
----
+
+![Ekran Görüntüsü](https://i.imgur.com/K7CHFBf.png)
+
 
 ### ✨ Özellikler
 
