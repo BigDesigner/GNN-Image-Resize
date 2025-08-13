@@ -8,6 +8,7 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -17,21 +18,20 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Build EXE
-        run: |
-          pyinstaller --onefile --noconsole ^
-            --name "GNNImageResize" ^
-            --hidden-import PIL._tkinter_finder ^
-            gnn_image_resize.py
-          dir dist
+      - name: Build EXE with Icon
+        run: pyinstaller --onefile --noconsole --name "GNNImageResize" --icon "icon.ico" --hidden-import PIL._tkinter_finder gnn_image_resize.py
+
+      - name: List dist
+        run: Get-ChildItem -Path dist -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: GNNImageResize
           path: dist/GNNImageResize.exe
+          if-no-files-found: error
